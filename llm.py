@@ -31,11 +31,10 @@ def build_agent_for_db_path(db_path: str, model: str = "groq:meta-llama/llama-4-
     
     def list_tables(state: MessagesState):
         """List all available tables in the database."""
-        tool_call = {"name": "sql_db_list_tables", "args": {}, "id": "list_tables", "type": "tool_call"}
-        tool_call_message = AIMessage(content="", tool_calls=[tool_call])
-        tool_message = list_tables_tool.invoke(tool_call)
-        response = AIMessage(f"Available tables: {tool_message.content}")
-        return {"messages": [tool_call_message, tool_message, response]}
+        # Directly invoke the tool without creating tool call messages
+        tables = db.get_usable_table_names()
+        response = AIMessage(f"Available tables: {', '.join(tables)}")
+        return {"messages": [response]}
 
     def call_get_schema(state: MessagesState):
         """Force model to get schema for relevant tables."""
