@@ -1,89 +1,71 @@
-from langchain.chat_models import init_chat_model
-import dotenv
 import os
-import requests
-
-dotenv.load_dotenv()
-
-llm = init_chat_model("groq:meta-llama/llama-4-scout-17b-16e-instruct", api_key=os.getenv("GROQ_API_KEY"))
-# url = "https://storage.googleapis.com/benchmarks-artifacts/chinook/Chinook.db"
-
-# response = requests.get(url)
-
-# if response.status_code == 200:
-#     # Open a local file in binary write mode
-#     with open("Chinook.db", "wb") as file:
-#         # Write the content of the response (the file) to the local file
-#         file.write(response.content)
-#     print("File downloaded and saved as Chinook.db")
-# else:
-#     print(f"Failed to download the file. Status code: {response.status_code}")
-
-from langchain_community.utilities import SQLDatabase
-from langchain_community.agent_toolkits import SQLDatabaseToolkit
 from typing import Literal, Tuple
+
+import dotenv
+from langchain.chat_models import init_chat_model
+from langchain_community.agent_toolkits import SQLDatabaseToolkit
+from langchain_community.utilities import SQLDatabase
 from langchain_core.messages import AIMessage
 from langgraph.graph import END, START, MessagesState, StateGraph
 from langgraph.prebuilt import ToolNode
 
+dotenv.load_dotenv()
+
 
 def build_agent_for_db_path(db_path: str, model: str = "groq:meta-llama/llama-4-scout-17b-16e-instruct") -> Tuple[object, SQLDatabase]:
-    local_llm = init_chat_model(model, api_key=os.getenv("GROQ_API_KEY"))
-    local_db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
-
-    local_toolkit = SQLDatabaseToolkit(db=local_db, llm=local_llm)
-    local_tools = local_toolkit.get_tools()
-
-    local_get_schema_tool = next(t for t in local_tools if t.name == "sql_db_schema")
-    local_get_schema_node = ToolNode([local_get_schema_tool], name="get_schema")
-
-    local_run_query_tool = next(t for t in local_tools if t.name == "sql_db_query")
-    local_run_query_node = ToolNode([local_run_query_tool], name="run_query")
-
-    def local_list_tables(state: MessagesState):
-        tool_call = {
-            "name": "sql_db_list_tables",
-            "args": {},
-            "id": "abc123",
-            "type": "tool_call",
-        }
+    """Build a SQL agent for the given database path."""
+    llm = init_chat_model(model, api_key=os.getenv("GROQ_API_KEY"))
+    db = SQLDatabase.from_uri(f"sqlite:///{db_path}")
+    
+    toolkit = SQLDatabaseToolkit(db=db, llm=llm)
+    tools = toolkit.get_tools()
+    
+    # Get required tools
+    get_schema_tool = next(t for t in tools if t.name == "sql_db_schema")
+    run_query_tool = next(t for t in tools if t.name == "sql_db_query")
+    list_tables_tool = next(t for t in tools if t.name == "sql_db_list_tables")
+    
+    # Create tool nodes
+    get_schema_node = ToolNode([get_schema_tool], name="get_schema")
+    run_query_node = ToolNode([run_query_tool], name="run_query")
+    
+    def list_tables(state: MessagesState):
+        """List all available tables in the database."""
+        tool_call = {"name": "sql_db_list_tables", "args": {}, "id": "list_tables", "type": "tool_call"}
         tool_call_message = AIMessage(content="", tool_calls=[tool_call])
-        list_tables_tool = next(t for t in local_tools if t.name == "sql_db_list_tables")
         tool_message = list_tables_tool.invoke(tool_call)
         response = AIMessage(f"Available tables: {tool_message.content}")
         return {"messages": [tool_call_message, tool_message, response]}
 
-    def local_call_get_schema(state: MessagesState):
-        llm_with_tools = local_llm.bind_tools([local_get_schema_tool], tool_choice="any")
+    def call_get_schema(state: MessagesState):
+        """Force model to get schema for relevant tables."""
+        llm_with_tools = llm.bind_tools([get_schema_tool], tool_choice="any")
         response = llm_with_tools.invoke(state["messages"])
         return {"messages": [response]}
 
-    generate_query_system_prompt_local = (
-        """
-You are an agent designed to interact with a SQL database.
-Given an input question, create a syntactically correct {dialect} query to run,
+    def generate_query(state: MessagesState):
+        """Generate SQL query based on user question."""
+        system_prompt = f"""You are an agent designed to interact with a SQL database.
+Given an input question, create a syntactically correct {db.dialect} query to run,
 then look at the results of the query and return the answer. Unless the user
 specifies a specific number of examples they wish to obtain, always limit your
-query to at most {top_k} results.
+query to at most 5 results.
 
 You can order the results by a relevant column to return the most interesting
 examples in the database. Never query for all the columns from a specific table,
 only ask for the relevant columns given the question.
 
-DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database.
-"""
-    ).format(dialect=local_db.dialect, top_k=5)
-
-    def local_generate_query(state: MessagesState):
-        system_message = {"role": "system", "content": generate_query_system_prompt_local}
-        llm_with_tools = local_llm.bind_tools([local_run_query_tool])
+DO NOT make any DML statements (INSERT, UPDATE, DELETE, DROP etc.) to the database."""
+        
+        system_message = {"role": "system", "content": system_prompt}
+        llm_with_tools = llm.bind_tools([run_query_tool])
         response = llm_with_tools.invoke([system_message] + state["messages"])
         return {"messages": [response]}
 
-    check_query_system_prompt_local = (
-        """
-You are a SQL expert with a strong attention to detail.
-Double check the {dialect} query for common mistakes, including:
+    def check_query(state: MessagesState):
+        """Double-check the generated query for common mistakes."""
+        system_prompt = f"""You are a SQL expert with a strong attention to detail.
+Double check the {db.dialect} query for common mistakes, including:
 - Using NOT IN with NULL values
 - Using UNION when UNION ALL should have been used
 - Using BETWEEN for exclusive ranges
@@ -96,45 +78,51 @@ Double check the {dialect} query for common mistakes, including:
 If there are any of the above mistakes, rewrite the query. If there are no mistakes,
 just reproduce the original query.
 
-You will call the appropriate tool to execute the query after running this check.
-"""
-    ).format(dialect=local_db.dialect)
-
-    def local_check_query(state: MessagesState):
-        system_message = {"role": "system", "content": check_query_system_prompt_local}
+You will call the appropriate tool to execute the query after running this check."""
+        
+        system_message = {"role": "system", "content": system_prompt}
         tool_call = state["messages"][-1].tool_calls[0]
         user_message = {"role": "user", "content": tool_call["args"]["query"]}
-        llm_with_tools = local_llm.bind_tools([local_run_query_tool], tool_choice="any")
+        llm_with_tools = llm.bind_tools([run_query_tool], tool_choice="any")
         response = llm_with_tools.invoke([system_message, user_message])
         response.id = state["messages"][-1].id
         return {"messages": [response]}
 
-    def local_should_continue(state: MessagesState) -> Literal[END, "check_query"]:
-        messages = state["messages"]
-        last_message = messages[-1]
-        if not getattr(last_message, "tool_calls", None):
-            return END
-        else:
-            return "check_query"
+    def should_continue(state: MessagesState) -> Literal[END, "check_query"]:
+        """Decide whether to continue to query checking or end."""
+        last_message = state["messages"][-1]
+        return "check_query" if getattr(last_message, "tool_calls", None) else END
 
+    # Build the graph
     builder = StateGraph(MessagesState)
-    builder.add_node("list_tables", local_list_tables)
-    builder.add_node("call_get_schema", local_call_get_schema)
-    builder.add_node("get_schema", local_get_schema_node)
-    builder.add_node("generate_query", local_generate_query)
-    builder.add_node("check_query", local_check_query)
-    builder.add_node("run_query", local_run_query_node)
-
-    builder.add_edge(START, "list_tables")
-    builder.add_edge("list_tables", "call_get_schema")
-    builder.add_edge("call_get_schema", "get_schema")
-    builder.add_edge("get_schema", "generate_query")
-    builder.add_conditional_edges("generate_query", local_should_continue)
-    builder.add_edge("check_query", "run_query")
-    builder.add_edge("run_query", "generate_query")
-
-    local_agent = builder.compile()
-    return local_agent, local_db
+    
+    # Add nodes
+    nodes = [
+        ("list_tables", list_tables),
+        ("call_get_schema", call_get_schema),
+        ("get_schema", get_schema_node),
+        ("generate_query", generate_query),
+        ("check_query", check_query),
+        ("run_query", run_query_node),
+    ]
+    for name, func in nodes:
+        builder.add_node(name, func)
+    
+    # Add edges
+    edges = [
+        (START, "list_tables"),
+        ("list_tables", "call_get_schema"),
+        ("call_get_schema", "get_schema"),
+        ("get_schema", "generate_query"),
+        ("check_query", "run_query"),
+        ("run_query", "generate_query"),
+    ]
+    for source, target in edges:
+        builder.add_edge(source, target)
+    
+    builder.add_conditional_edges("generate_query", should_continue)
+    
+    return builder.compile(), db
 
 
 if __name__ == "__main__":

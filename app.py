@@ -1,111 +1,192 @@
 import os
 import tempfile
+from datetime import datetime
+
 import streamlit as st
+
 from llm import build_agent_for_db_path
 
+# Configure page
+st.set_page_config(page_title="SQL Chat Agent", page_icon="💬", layout="wide")
 
-st.set_page_config(page_title="SQL Agent POC", page_icon="🗄️")
-st.title("SQL Agent POC")
-st.caption("Upload a SQLite .db file and ask questions in natural language.")
-
+# Initialize session state
+def init_session_state():
+    """Initialize session state variables."""
+    defaults = {
+        "messages": [],
+        "db_path": None,
+        "agent": None,
+        "db": None,
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
 
 @st.cache_resource(show_spinner=False)
 def get_agent(db_path: str):
-    agent, db = build_agent_for_db_path(db_path)
-    return agent, db
+    """Get cached agent and database for the given path."""
+    return build_agent_for_db_path(db_path)
 
+def setup_database():
+    """Handle database upload and initialization."""
+    uploaded = st.file_uploader("Upload SQLite .db file", type=["db", "sqlite", "sqlite3"])
+    
+    if uploaded is not None:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
+            tmp.write(uploaded.getbuffer())
+            if st.session_state.db_path != tmp.name:
+                st.session_state.db_path = tmp.name
+                st.session_state.agent = None
+                st.session_state.messages = []
+                st.success("Database uploaded!")
+    
+    # Use default database if available
+    if st.session_state.db_path is None:
+        default_path = os.path.join(os.getcwd(), "Chinook.db")
+        if os.path.exists(default_path):
+            st.session_state.db_path = default_path
+            st.info("Using bundled Chinook.db")
+    
+    # Initialize agent
+    if st.session_state.db_path and st.session_state.agent is None:
+        try:
+            with st.spinner("Loading database..."):
+                st.session_state.agent, st.session_state.db = get_agent(st.session_state.db_path)
+            st.success("Database loaded!")
+        except Exception as e:
+            st.error(f"Failed to load database: {e}")
 
-uploaded = st.file_uploader("Upload SQLite .db file", type=["db", "sqlite", "sqlite3"], accept_multiple_files=False)
+def display_database_info():
+    """Display database information in sidebar."""
+    if st.session_state.db:
+        st.subheader("📊 Database Info")
+        st.write(f"**Dialect:** {st.session_state.db.dialect}")
+        with st.expander("Available Tables", expanded=False):
+            tables = sorted(st.session_state.db.get_usable_table_names())
+            for table in tables:
+                st.write(f"• {table}")
 
-db_path = None
-if uploaded is not None:
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".db") as tmp:
-        tmp.write(uploaded.getbuffer())
-        db_path = tmp.name
-        st.success(f"Uploaded database saved to: {db_path}")
+def parse_step_info(message, step_count):
+    """Parse step information from agent message."""
+    step_info = {"step": step_count}
+    
+    if hasattr(message, 'tool_calls') and message.tool_calls:
+        tool_call = message.tool_calls[0]
+        step_info["tool_call"] = {
+            "name": tool_call['name'],
+            "args": tool_call.get('args', {})
+        }
+    elif message.content:
+        step_info["content"] = message.content
+    else:
+        step_info["type"] = type(message).__name__
+    
+    return step_info
 
-example_path = os.path.join(os.getcwd(), "Chinook.db")
-if db_path is None and os.path.exists(example_path):
-    st.info("No file uploaded. Using bundled Chinook.db for demo.")
-    db_path = example_path
-
-if db_path:
-    try:
-        agent, db = get_agent(db_path)
-        st.write(f"Dialect: {db.dialect}")
-        with st.expander("Tables", expanded=False):
-            st.write(sorted(list(db.get_usable_table_names())))
-
-        question = st.text_input("Ask a question about your data", value="Which genre on average has the longest tracks?")
-        run = st.button("Run")
-
-        if run and question.strip():
-            st.subheader("Agent Execution (Live)")
+def display_execution_steps(steps):
+    """Display execution steps in an expandable section."""
+    with st.expander(f"🔍 View execution steps ({len(steps)} steps)", expanded=False):
+        for i, step in enumerate(steps, 1):
+            st.markdown(f"**Step {i}:**")
             
-            # Create containers for live updates
-            status_container = st.container()
-            steps_container = st.container()
-            answer_container = st.container()
+            if step.get("tool_call"):
+                tool_call = step["tool_call"]
+                st.markdown(f"🔧 **Tool:** `{tool_call['name']}`")
+                if tool_call.get('args'):
+                    st.json(tool_call['args'])
+            elif step.get("content"):
+                st.markdown(f"💬 **Response:** {step['content']}")
+            else:
+                st.markdown(f"📝 **Type:** {step.get('type', 'Unknown')}")
             
-            with status_container:
-                status = st.empty()
-                
-            with steps_container:
-                step_placeholder = st.empty()
-                
-            messages = []
-            step_count = 0
+            if i < len(steps):
+                st.markdown("---")
+
+# Initialize app
+init_session_state()
+
+# Sidebar
+with st.sidebar:
+    st.header("🗄️ Database Setup")
+    setup_database()
+    display_database_info()
+    
+    if st.button("🗑️ Clear Chat", use_container_width=True):
+        st.session_state.messages = []
+        st.rerun()
+
+# Main chat interface
+st.title("💬 SQL Chat Agent")
+st.caption("Ask questions about your database in natural language")
+
+if not st.session_state.agent:
+    st.warning("Please upload a database file or place 'Chinook.db' in the project root to start chatting.")
+else:
+    # Display chat history
+    for message in st.session_state.messages:
+        if message["role"] == "user":
+            with st.chat_message("user"):
+                st.write(message["content"])
+        else:
+            with st.chat_message("assistant"):
+                st.write(message["content"])
+                if "steps" in message:
+                    display_execution_steps(message["steps"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask a question about your database..."):
+        # Add and display user message
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.write(prompt)
+        
+        # Generate assistant response
+        with st.chat_message("assistant"):
+            thinking_placeholder = st.empty()
+            response_placeholder = st.empty()
+            
+            thinking_placeholder.info("🤔 Thinking...")
             
             try:
-                for step in agent.stream({"messages": [{"role": "user", "content": question}]}, stream_mode="values"):
-                    step_count += 1
-                    last = step["messages"][-1]
-                    messages.append(last)
-                    
-                    # Update status
-                    status.info(f"Step {step_count}: Processing...")
-                    
-                    # Show current step live
-                    with step_placeholder.container():
-                        st.markdown(f"### Step {step_count}")
-                        
-                        if hasattr(last, 'tool_calls') and last.tool_calls:
-                            tool_call = last.tool_calls[0]
-                            st.markdown(f"**🔧 Tool Call:** `{tool_call['name']}`")
-                            if tool_call.get('args'):
-                                st.json(tool_call['args'])
-                        elif last.content:
-                            st.markdown(f"**💬 Response:** {last.content}")
-                        else:
-                            st.markdown(f"**📝 Message Type:** {type(last).__name__}")
-                            
-                        st.markdown("---")
-                    
-                    # Small delay to make it visible
-                    import time
-                    time.sleep(0.5)
+                messages = []
+                steps = []
+                step_count = 0
                 
-                # Final status and answer
-                status.success(f"✅ Completed in {step_count} steps")
+                # Stream agent execution
+                for step in st.session_state.agent.stream(
+                    {"messages": [{"role": "user", "content": prompt}]}, 
+                    stream_mode="values"
+                ):
+                    step_count += 1
+                    last_message = step["messages"][-1]
+                    messages.append(last_message)
+                    steps.append(parse_step_info(last_message, step_count))
+                    thinking_placeholder.info(f"🔄 Step {step_count}: Processing...")
+                
+                thinking_placeholder.empty()
                 
                 if messages and messages[-1].content:
-                    with answer_container:
-                        st.subheader("🎯 Final Answer")
-                        st.success(messages[-1].content)
-                        
+                    final_answer = messages[-1].content
+                    response_placeholder.success(final_answer)
+                    
+                    # Add to chat history
+                    st.session_state.messages.append({
+                        "role": "assistant", 
+                        "content": final_answer,
+                        "steps": steps,
+                        "timestamp": datetime.now()
+                    })
+                else:
+                    response_placeholder.error("No response generated")
+                    
             except Exception as e:
-                status.error(f"❌ Error: {str(e)}")
-                st.error(f"Agent execution failed: {e}")
-
-            # Optional: Show full trace in expander
-            if messages:
-                with st.expander("🔍 Full Debug Trace", expanded=False):
-                    for i, m in enumerate(messages, start=1):
-                        st.markdown(f"**Step {i}:** {type(m).__name__}")
-                        st.code(str(m))
-    except Exception as e:
-        st.error(f"Failed to initialize agent: {e}")
-else:
-    st.warning("Upload a database file to begin, or place `Chinook.db` in the project root.")
+                thinking_placeholder.empty()
+                response_placeholder.error(f"Error: {str(e)}")
+                st.session_state.messages.append({
+                    "role": "assistant", 
+                    "content": f"Sorry, I encountered an error: {str(e)}",
+                    "steps": [],
+                    "timestamp": datetime.now()
+                })
 
 
