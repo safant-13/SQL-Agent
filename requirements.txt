@@ -5,3 +5,4 @@ streamlit>=1.36.0
 python-dotenv>=1.0.0
 sqlalchemy>=2.0.29
 pydantic>=2.6.0
+langchain-groq
